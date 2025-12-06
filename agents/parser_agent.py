@@ -62,7 +62,14 @@ class ParserAgent:
                     logger.info(f"Parsed event heuristically: {event.title}")
                     return self._enrich_event(event, raw_data, source)
             
-            logger.warning(f"Failed to parse event from {source}")
+            # Fallback to snippet-based parsing (for search results without HTML)
+            if "snippet" in raw_data and "title" in raw_data:
+                event = self._parse_snippet(raw_data)
+                if event:
+                    logger.info(f"Parsed event from snippet: {event.title}")
+                    return self._enrich_event(event, raw_data, source)
+            
+            logger.warning(f"Failed to parse event from {source} - {raw_data}")
             return None
             
         except Exception as e:
@@ -228,6 +235,109 @@ class ParserAgent:
             tags=self._extract_tags(text),
         )
     
+    def _parse_snippet(self, raw_data: Dict[str, Any]) -> Optional[CanonicalEvent]:
+        """
+        Parse event from search result snippet (when HTML is not available).
+        This is a lightweight parser for Tavily search results.
+        """
+        title = raw_data.get("title", "").strip()
+        snippet = raw_data.get("snippet", "").strip()
+        url = raw_data.get("url")
+        
+        if not title or not snippet:
+            return None
+        
+        # Combine title and snippet for analysis
+        combined_text = f"{title} {snippet}"
+        
+        # Try to extract dates from snippet
+        dates = self._extract_dates_from_text(combined_text)
+        
+        # Detect pitch slots to determine if this is likely an event
+        pitch_slots = self._detect_pitch_slots(combined_text)
+        
+        # If no dates found, check if this looks like a pitch event
+        if not dates:
+            # Check for event-related keywords
+            event_keywords = ['summit', 'conference', 'event', 'meetup', 'demo day', 
+                            'pitch', 'competition', 'hackathon', 'workshop']
+            text_lower = combined_text.lower()
+            is_likely_event = any(keyword in text_lower for keyword in event_keywords)
+            
+            if is_likely_event or pitch_slots:
+                # Create event with estimated future date
+                from datetime import timedelta
+                default_date = datetime.utcnow() + timedelta(days=30)
+                logger.warning(f"No dates found in snippet for: {title}. Using default date: {default_date}")
+                
+                # Extract tags and add 'date-uncertain' tag
+                tags = self._extract_tags(combined_text)
+                tags.append('date-uncertain')
+                
+                # Extract location hints from snippet
+                venue = self._extract_venue_from_text(combined_text)
+                
+                return CanonicalEvent(
+                    title=title,
+                    description=snippet[:500] + " [Date uncertain - please verify]",
+                    start_utc=default_date,
+                    end_utc=default_date,
+                    venue=venue,
+                    registration=Registration(type="rsvp", url=url),
+                    organizer=Organizer(name="Unknown"),
+                    pitch_slots=pitch_slots,
+                    tags=tags,
+                )
+            else:
+                logger.debug(f"No dates found in snippet for: {title} and no event indicators")
+                return None
+        
+        start_date = dates[0]
+        end_date = dates[1] if len(dates) > 1 else start_date
+        
+        # Extract location hints from snippet
+        venue = self._extract_venue_from_text(combined_text)
+        
+        # Extract tags
+        tags = self._extract_tags(combined_text)
+        
+        return CanonicalEvent(
+            title=title,
+            description=snippet[:500],  # Use snippet as description
+            start_utc=start_date,
+            end_utc=end_date,
+            venue=venue,
+            registration=Registration(type="rsvp", url=url),
+            organizer=Organizer(name="Unknown"),
+            pitch_slots=pitch_slots,
+            tags=tags,
+        )
+    
+    def _extract_venue_from_text(self, text: str) -> Venue:
+        """Extract venue information from text."""
+        text_lower = text.lower()
+        
+        # Check for online indicators
+        online_keywords = ['online', 'virtual', 'webinar', 'zoom', 'teams', 'meet']
+        if any(keyword in text_lower for keyword in online_keywords):
+            return Venue(type="online", name="Online Event")
+        
+        # Try to extract city names (simple heuristic)
+        # Look for common patterns like "in [City]" or "at [Location]"
+        city_pattern = r'\bin\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'
+        city_match = re.search(city_pattern, text)
+        
+        if city_match:
+            city = city_match.group(1)
+            return Venue(
+                type="in-person",
+                name=f"Event in {city}",
+                city=city,
+            )
+        
+        # Default to online if unclear
+        return Venue(type="online")
+    
     def _detect_pitch_slots(self, text: str) -> Optional[PitchSlots]:
         """Detect if event has pitch slots from text."""
         pitch_keywords = [
@@ -304,23 +414,49 @@ class ParserAgent:
     
     def _extract_dates_from_text(self, text: str) -> List[datetime]:
         """Extract dates from plain text."""
-        # Simple regex for common date formats
-        # This is a simplified version - production would use more sophisticated NER
+        # Comprehensive regex patterns for various date formats
         date_patterns = [
-            r'\d{4}-\d{2}-\d{2}',  # ISO format
-            r'\d{1,2}/\d{1,2}/\d{4}',  # MM/DD/YYYY
-            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}',
+            r'\d{4}-\d{2}-\d{2}',  # ISO format: 2025-12-06
+            r'\d{1,2}/\d{1,2}/\d{4}',  # MM/DD/YYYY: 12/06/2025
+            r'\d{1,2}-\d{1,2}-\d{4}',  # DD-MM-YYYY: 06-12-2025
+            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:st|nd|rd|th)?,? \d{4}',  # Month DD, YYYY
+            r'\d{1,2}(?:st|nd|rd|th)? (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4}',  # DD Month YYYY
+            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:st|nd|rd|th)?',  # Month DD (current/next year)
+            r'\d{1,2}(?:st|nd|rd|th)? (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*',  # DD Month (current/next year)
         ]
         
         dates = []
+        matched_strings = []
+        
         for pattern in date_patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches[:2]:  # Take first 2 dates
+            for match in matches:
+                if match in matched_strings:
+                    continue  # Skip duplicates
+                    
                 try:
-                    dt = date_parser.parse(match)
+                    dt = date_parser.parse(match, fuzzy=True)
+                    # If no year specified, assume current or next year
+                    if dt.year < datetime.now().year:
+                        dt = dt.replace(year=datetime.now().year)
                     dates.append(dt)
-                except:
+                    matched_strings.append(match)
+                    logger.debug(f"Extracted date '{match}' -> {dt}")
+                except Exception as e:
+                    logger.debug(f"Failed to parse date '{match}': {e}")
                     continue
+                    
+                if len(dates) >= 2:  # Take first 2 dates max
+                    break
+            
+            if len(dates) >= 2:
+                break
+        
+        if dates:
+            logger.debug(f"Found {len(dates)} date(s) in text")
+        else:
+            logger.debug(f"No dates found. Tried patterns: {date_patterns}")
+            logger.debug(f"Text sample: {text[:200]}")
         
         return dates
     
@@ -353,12 +489,19 @@ class ParserAgent:
         source: str
     ) -> CanonicalEvent:
         """Add source provenance to event."""
+        # Prepare raw_data dict for EventSource (must be dict, not string)
+        source_raw_data = {
+            'snippet': raw_data.get('snippet'),
+            'title': raw_data.get('title'),
+            'url': raw_data.get('url'),
+        }
+        
         event.sources.append(
             EventSource(
                 source=source,
                 source_url=raw_data.get('url'),
                 fetched_at=datetime.utcnow(),
-                raw_data=raw_data.get('snippet'),
+                raw_data=source_raw_data,
             )
         )
         return event

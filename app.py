@@ -329,8 +329,8 @@ def render_event_card(ranked_event: RankedEvent):
         col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
         
         with col_btn1:
-            if event.registration.url:
-                st.link_button("🎫 Register", event.registration.url)
+            if event.registration and event.registration.url:
+                st.link_button("🎫 Register", str(event.registration.url))
         
         with col_btn2:
             if event.pitch_slots and event.pitch_slots.application_url:

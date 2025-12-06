@@ -43,9 +43,9 @@ ENV/
 .streamlit/
 
 # Data
-data/
-*.db
-*.sqlite
+#data/
+#*.db
+#*.sqlite
 
 # Chroma vector database
 chroma/
