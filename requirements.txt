@@ -1,0 +1,49 @@
+# Core Framework
+streamlit>=1.28.0
+python-dotenv>=1.0.0
+
+# AI & LLM
+openai>=1.0.0
+tavily-python>=0.3.0
+langchain>=0.1.0
+langchain-openai>=0.0.2
+
+# Vector Database
+chromadb>=0.4.0
+# Alternative: pinecone-client>=2.2.0
+# Alternative: weaviate-client>=3.25.0
+
+# Web Scraping & Fetching
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+httpx>=0.25.0
+
+# Data Processing
+pydantic>=2.0.0
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# Platform APIs
+eventbrite>=0.3.0
+# meetup-api (custom implementation)
+
+# Task Orchestration
+celery>=5.3.0
+redis>=5.0.0
+# Alternative: prefect>=2.0.0
+# Alternative: ray>=2.8.0
+
+# Utilities
+tenacity>=8.2.0  # retry logic
+validators>=0.22.0
+pyyaml>=6.0
+
+# Monitoring & Logging
+loguru>=0.7.0
+prometheus-client>=0.19.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.12.0

@@ -1,0 +1,379 @@
+# Streamlit Capstone — **Realtime Startup Pitch Finder**
+
+> A single-shot, developer-focused prompt + architecture & agent spec to build a Streamlit app that finds *real-time* startup pitch events (founder & investor entry), uses web search + platform APIs, stores facts in a vector DB, and implements RAG + a multi-agent system.
+
+---
+
+## Project summary (single-sentence prompt for the team)
+
+> Build a Streamlit web app that accepts a user’s intent (e.g., “I’m a seed-stage founder looking to pitch in Bangalore next 30 days”) and returns ranked, de-duplicated, actionable event entries (ticket/register/join links, pitch slots, organizer contact) by continuously searching the web (Tavily/Google/Platform APIs), extracting and normalizing event details, storing canonical event embeddings in a vector database for RAG, and exposing a conversational assistant + matching engine that identifies the best entry path (apply, register, sponsor, join waitlist).
+
+---
+
+## Why use Tavily as the real-time web layer
+
+Tavily is purpose-built as a real-time search / web-access layer designed for AI agents and RAG workflows; it provides fast, structured search results and tight integrations with agent frameworks (quickstart, docs and LangChain integrations available). ([Tavily][1])
+
+---
+
+## High-level architecture (components)
+
+1. **Streamlit UI (Frontend)**
+
+   * Interactive query form + persona selector (Founder / Investor) + filters (date range, region, industry, ticket price, pitch-only vs demo day).
+   * Results panel: ranked event cards, reason string (why match), direct actions (Apply/Register/Contact).
+   * Conversational assistant sidecar (RAG-backed chat) for clarifying user intent and explaining matches.
+
+2. **Realtime Search Layer (Agent Input)**
+
+   * **Tavily Search** for fast, agent-first web search (primary). ([Tavily][1])
+   * Platform APIs: Eventbrite, Meetup, LinkedIn Events (if access), Facebook Events (Graph), Twitter/X, Google Calendar/Google CSE, RSS feeds, regional event portals.
+   * Optional scraping fallback (Playwright + domain-specific parsers) for pages lacking API output.
+
+3. **Agent Orchestration / Multi-Agent System**
+
+   * Lightweight orchestrator (CrewAI/Celery/Prefect/Ray) that runs specialized agents (see *Agents* section). CrewAI-style agent frameworks integrate with Tavily. ([Tavily Docs][2])
+
+4. **Normalization & Extraction**
+
+   * Parsers that convert raw search results / HTML / APIs into canonical event schemas (title, start/end, venue, online/in-person, pitch slots, organizer, registration URL, price, deadlines, tags, source, last-fetched).
+
+5. **Vector Database (persistent canonical store + RAG)**
+
+   * Store canonical event documents and embeddings (one vector per canonical event; incremental update on dedupe). Use a production vector DB: **Pinecone / Milvus / Weaviate / Chroma** depending on scale & budget. (Design for easy replacement.)
+
+6. **Embedding & LLM Layer**
+
+   * Embeddings (OpenAI/OT-embeddings, or open-source models) to index event text + metadata.
+   * LLMs to power RAG retrieval responses, summary generation, and assistant reasoning.
+
+7. **Deduper / Canonicalizer & Updater**
+
+   * Responsible for identifying duplicate event records across sources, merging into canonical entries, and storing provenance.
+
+8. **Ranker & Matcher**
+
+   * Ranking model that combines retrieval score (semantic match), user intent match, recency, credibility score (source trust), and logistics (distance, availability) to produce top N events.
+
+9. **Action Runner / Automation Agent**
+
+   * Automates actions where possible: pre-fill registration forms, send email to organizer, create calendar events, or surface the exact registration steps.
+
+10. **Monitoring / Observability**
+
+    * Instrumentation for fetch success, API rate limits, dedupe quality, user feedback, and periodic re-indexing.
+
+---
+
+## Canonical event schema (JSON)
+
+```json
+{
+  "event_id": "canonical-uuid",
+  "title": "Startup Pitch Night — Bangalore",
+  "description": "...",
+  "start_utc": "2026-01-20T14:00:00Z",
+  "end_utc": "2026-01-20T17:00:00Z",
+  "timezone": "Asia/Kolkata",
+  "venue": {
+    "type": "in-person",
+    "name": "Namma Startup Hub",
+    "address": "..."
+  },
+  "online_url": null,
+  "pitch_slots": {
+    "available": true,
+    "slot_count": 10,
+    "application_deadline": "2026-01-01"
+  },
+  "registration": {
+    "type": "ticket",
+    "url": "https://eventbrite/...",
+    "price": 0
+  },
+  "organizer": {
+    "name": "StartupX",
+    "contact_email": "hello@startupx.com"
+  },
+  "tags": ["seed", "demo-day", "fintech"],
+  "sources": [
+    {"source": "eventbrite", "source_id": "123", "fetched_at":"..."},
+    {"source":"tavily", "raw_url":"..."}
+  ],
+  "provenance": {...},
+  "embedding_id": "vec-xyz",
+  "last_canonicalized_at": "2025-12-05T..."
+}
+```
+
+---
+
+## Agents — roles & representative prompts (detailed)
+
+> Each agent is a stateless/minimally stateful worker that receives a structured task, uses tools (Tavily, platform APIs, scraper, embeddings), and returns structured JSON. The orchestration layer composes agents.
+
+### 1. **SearchAgent (web researcher)**
+
+**Role:** Run real-time queries across Tavily + configured platform APIs and return raw hits with metadata.
+**Capabilities:** Tavily search (query templates, domain filters, date filters). Fallback: Google CSE / site-specific APIs.
+**Representative system prompt:**
+
+```
+You are SearchAgent. Input: {user_query, date_range, location, filters}. Use Tavily to execute high-recall searches for event pages and platform APIs. Return top 50 raw hits with {title, snippet, url, publish_date, source_id, fetch_score}. Tag results by platform (eventbrite, meetup, linkedin, generic).
+```
+
+**Notes:** Use search depth “news” or “general” depending on recency needs; throttle requests to avoid rate limits. ([Tavily Docs][3])
+
+---
+
+### 2. **FetcherAgent (content retriever + screenshotter)**
+
+**Role:** Fetch the full HTML or structured API payload for each hit. If page is a PDF or image, create a screenshot or store metadata.
+**Representative prompt:**
+
+```
+Fetch the given URL with appropriate headers and return: {content_type, html, text, http_status, canonical_url, meta_tags, structured_data (json-ld if present)}. If JavaScript-only page, use headless browser (Playwright) snapshot.
+```
+
+---
+
+### 3. **ParserAgent (extractor & normalizer)**
+
+**Role:** Parse raw HTML/API payloads and extract canonical fields (see schema). Use robust extraction: JSON-LD, microdata, heuristics, date parsing, NER for organizer and pitch-slot detection.
+**Representative prompt:**
+
+```
+Input: raw_html or API JSON. Output: canonical event JSON. Prioritize machine-readable data (json-ld). If pitch-slot info present (words: 'pitch','apply','demo','speaker'), capture accurate slot info and deadlines.
+```
+
+---
+
+### 4. **DeduperAgent (canonicalizer)**
+
+**Role:** Given a new parsed event, decide whether it matches an existing canonical event (fuzzy title, venue + times, registration url) using semantic similarity + heuristics, and either merge or create new canonical record.
+**Representative prompt:**
+
+```
+Input: parsed_event + top_k candidates from vector DB (by embedding similarity). Decide: merge/update or create new. Produce merged canonical event with provenance + change log.
+```
+
+---
+
+### 5. **EmbedderAgent**
+
+**Role:** Create embeddings for canonical event text + metadata. For each event, produce an embedding vector used in the vector DB plus a short canonical summary (50–80 words).
+**Prompt:**
+
+```
+Summarize the event in 50–80 words for quick scanning, then return embedding vector for [title + description + tags + organizer]. Use the configured embedding model.
+```
+
+---
+
+### 6. **RankerAgent (match & scoring)**
+
+**Role:** Score canonical events for a given user request by combining semantic similarity (vector score), recency, proximity, pitch-slot availability, and organizer credibility. Return ranked list with a reason string (explainability).
+**Prompt:**
+
+```
+Input: user_profile, user_constraints, candidate_events. Score each candidate [0..1] using weighted features: semantic_similarity (0.5), recency(0.15), logistics(0.15), pitch_slot_availability(0.15), credibility(0.05). Output: top N events with score and explanation.
+```
+
+---
+
+### 7. **ActionAgent (automation & prefill)**
+
+**Role:** For a chosen event, try automated actions: generate a prefilled registration payload or a suggested email/message to organizer (templated), and surface exact steps to secure pitch entry.
+**Prompt:**
+
+```
+Given event canonical record and user_profile (name, startup, stage, pitch_deck_url), produce: (A) prefill form fields for known registration forms, (B) 3 alternate message templates to organizer (short, long, persuasive).
+```
+
+---
+
+### 8. **AssistantAgent (RAG conversational assistant)**
+
+**Role:** Answer user follow-ups using the vector DB + LLM RAG pipeline. Provide citations (source links + fetch timestamps). Should explain *why* an event is recommended.
+**Prompt pattern:**
+
+```
+User question + Retriever(top-k by semantic match). Compose answer using retrieved canonical docs and LLM; include inline citations to canonical sources and show the provenance list for each claim.
+```
+
+---
+
+## Streamlit app UX & flow
+
+1. **Landing**: quick intent selector (founder vs investor), location & date range, tags.
+2. **Search**: user hits Search → UI sends intent to backend orchestrator → SearchAgent runs across Tavily & platform APIs → Parser → Deduper → Embedder → Index update.
+3. **Results**: Top 10 event cards with short summaries, match score, key facts, action buttons (Apply, Save, Ask Assistant). Each card shows provenance (source icons) and last-checked timestamp.
+4. **Assistant panel**: Ask clarifying Qs, request “how to get a pitch slot” — runs RAG to show step-by-step actions.
+5. **Saved / My Matches**: persistent user list, auto-refresh (background periodic re-check) to reflect last-known ticket state.
+
+---
+
+## Data flow & real-time semantics
+
+* **Realtime**: Use Tavily for immediate web freshness on-demand when a user searches. Cache results for TTL (e.g., 30 minutes). ([Tavily Docs][4])
+* **Continuous background re-check**: Periodic jobs (cron/Prefect) re-run search for saved canonical events to update availability. (Design for eventual consistency — show “last checked” to the user.)
+* **Immediate notification**: If an organizer opens pitch slots or a new matching event appears, push UI notification / email.
+
+> Implementation note: "real-time" here means sub-5s response for search+initial ranking using Tavily + vector lookup; background processes can do deeper crawling and enrichment.
+
+---
+
+## Storage & infra choices
+
+* **Vector DB**: Pinecone / Weaviate / Milvus / Chroma — pick based on scale. Use per-event vector + metadata store.
+* **Primary object store**: S3-compatible (for HTML snapshots, screenshots).
+* **Metadata DB**: Lightweight relational (Postgres) or managed KV for canonical metadata; vector DB holds embeddings & pointers. *(You previously asked to replace Postgres with vectordb — keep a minimal metadata store in the vector DB metadata fields and a small document DB like Mongo if relational constraints are needed.)*
+* **Queue / Workers**: Redis + RQ / Celery, or Ray for parallel agents.
+* **Hosting**: Streamlit Cloud or containerized (Docker + Kubernetes) for scale.
+* **Secrets & keys**: Vault or environment secrets (Tavily API key, Eventbrite keys, LLM API keys).
+
+---
+
+## Security, privacy & rate limits
+
+* Respect platform ToS (LinkedIn, Facebook often restrict scraping). Prefer official APIs.
+* Rate limit all external calls; implement exponential backoff & circuit breakers.
+* Store contact info encrypted at rest. Comply with GDPR style rules for personal data and allow user to delete saved items.
+
+---
+
+## Observability & QA
+
+* Track: fetch success rate, duplicate merge rate, user conversion (applies), user feedback on match quality.
+* Unit tests: parsing rules per-platform, dedupe tests, end-to-end search+index flow with mocked APIs.
+* Use lightweight human-in-the-loop validation for new high-value sources.
+
+---
+
+## Example implementation plan (milestones)
+
+1. **MVP (2–3 sprints)**
+
+   * Streamlit UI + simple SearchAgent using Tavily; parse few platforms (Eventbrite, Meetup via API). Index to Chroma. Return ranked list via simple semantic matching.
+2. **Core features (2–4 sprints)**
+
+   * DeduperAgent, embedder, RAG assistant, basic ActionAgent (email templates). More platform integrations.
+3. **Scale & polish (2–4 sprints)**
+
+   * Robust scraper fallbacks, advanced ranking model, production vector DB (Pinecone/Milvus), monitoring, worker autoscaling.
+4. **Optional**
+
+   * Pre-fill registration automation (Selenium/Playwright + guardrails), organizer outreach automation (with user consent).
+
+---
+
+## Prompt engineering — **turnkey prompts** (copy-paste ready)
+
+### SearchAgent (Tavily) — executable prompt (Python pseudo)
+
+```
+# meta: use Tavily search API
+system:
+  "You are SearchAgent: high-recall web researcher for startup pitch events. Use Tavily and configured platform APIs."
+task:
+  {
+    "q": "{user_query}",
+    "filters": {"region":"{region}", "date_from":"{date_from}", "date_to":"{date_to}", "domains":["eventbrite.com","meetup.com","linkedin.com","facebook.com","twitter.com"]},
+    "max_hits": 50
+  }
+expected_output:
+  [
+    {"title": "...", "snippet":"...", "url":"...", "source":"eventbrite", "publish_date":"...", "score":...}
+  ]
+```
+
+### ParserAgent — canonicalize
+
+```
+system:
+  "You are ParserAgent: extract structured event data from raw html or api json."
+input:
+  { "url": "...", "raw_html":"...", "api_json": {...} }
+output:
+  canonical_event_json (see schema)
+notes:
+  "Prefer json-ld, fallback to pattern matching and NER. Normalize times to UTC and include timezone."
+```
+
+### RAG Assistant prompt (user-facing)
+
+```
+system:
+  "You are the PitchFinder assistant. Answer using retrieved canonical event docs. Always include citations to sources with timestamps and a short 1–2 line 'action plan' showing what user should do next to attend or apply."
+user:
+  "{user_question}"
+retriever:
+  top_k = 6 from vector_db
+```
+
+---
+
+## Operational & edge-case considerations
+
+* **Stale / canceled events**: mark canonical status when registration page 404s or organizer marks canceled.
+* **Duplicate/near-duplicate detection**: vector similarity + domain heuristics (same registration url). When uncertain, surface both and add a “likely duplicate” flag.
+* **Platform access limits**: maintain per-platform connectors and fallback to scraping where allowed. Respect robots.txt and rate limits.
+* **Explainability**: Always show provenance (sources & last fetch time) so users can verify.
+
+---
+
+## Suggested tech stack (concrete)
+
+* Frontend: **Streamlit** (app)
+* Orchestration: **Prefect / Celery / Ray** (workers)
+* Realtime web layer: **Tavily** + optional Google CSE / direct platform APIs. ([Tavily Docs][4])
+* Vector DB: **Pinecone / Weaviate / Milvus / Chroma**
+* Embeddings & LLM: OpenAI APIs or self-hosted LLM + compatible embedding model
+* Scraping: **Playwright** (JS rendering) + BeautifulSoup / Readability
+* Storage: AWS S3 (snapshots), small document DB (Mongo/Postgres) for non-vector metadata (optional)
+* Monitoring: Prometheus + Grafana, Sentry for errors
+
+---
+
+## Deliverables you can paste into a Streamlit repo (starter to-do)
+
+* `app.py` Streamlit skeleton (UI + API endpoints).
+* Agents folder: `search_agent.py`, `fetcher.py`, `parser.py`, `deduper.py`, `embedder.py`, `ranker.py`, `action_agent.py`.
+* `models/` for prompts and scoring weights.
+* `infra/` Terraform for vector DB + S3 + worker cluster.
+* Tests: `tests/test_parsers.py`, `tests/test_dedupe.py`.
+
+---
+
+## Example UX copy for a result card
+
+> **Startup Pitch Night — Bangalore** — 2026-01-20 — *Pitch slots available*
+> Score: 0.92 — **Why:** semantic match to "seed fintech", open pitch application (deadline Jan 1).
+> Actions: [Apply] [Save] [Contact Organizer]
+> Sources: Eventbrite (fetched 2025-12-05) · Organizer page (fetched 2025-12-04)
+
+---
+
+## Final checklist before coding
+
+* [ ] Acquire Tavily API key and test quicksearch (get 1,000 credits). ([Tavily Docs][4])
+* [ ] Decide vector DB vendor & proc model (managed vs self-hosted).
+* [ ] Implement minimal parser for Eventbrite + Meetup first (fast wins).
+* [ ] Build Streamlit UI + simple RAG assistant that retrieves from local Chroma/Pinecone.
+* [ ] Add dedupe + merge logic + provenance display.
+
+---
+
+## Useful references
+
+* Tavily docs & quickstart (developer-focused real-time search for agents). ([Tavily Docs][5])
+* Tavily + LangChain integration examples. ([LangChain Docs][6])
+
+---
+
+## Closing / single-line developer prompt to paste into a repo README
+
+> “Create a Streamlit app that accepts user intent and returns ranked, de-duplicated startup pitch events by orchestrating SearchAgent (Tavily + platform APIs), ParserAgent (extract), DeduperAgent (canonicalize), EmbedderAgent (vectors), RankerAgent (match), and an AssistantAgent (RAG), storing canonical documents + embeddings in a vector DB and enabling one-click actions (apply/register) with provenance and explainability.”
+
+---
+
