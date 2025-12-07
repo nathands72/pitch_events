@@ -17,7 +17,11 @@ class EmbedderAgent:
     
     def __init__(self):
         settings = get_settings()
-        self.client = OpenAI(api_key=settings.openai_api_key)
+        # Initialize OpenAI client with optional custom base URL
+        client_kwargs = {"api_key": settings.openai_api_key}
+        if settings.openai_base_url:
+            client_kwargs["base_url"] = settings.openai_base_url
+        self.client = OpenAI(**client_kwargs)
         self.model = settings.embedding_model
     
     def embed_event(self, event: CanonicalEvent) -> tuple[List[float], str]:

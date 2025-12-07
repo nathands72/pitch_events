@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     
     # API Keys
     openai_api_key: str = ""
+    openai_base_url: str = ""  # Optional custom OpenAI API endpoint
     tavily_api_key: str = ""
     eventbrite_api_key: str = ""
     meetup_api_key: str = ""
