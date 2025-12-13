@@ -158,27 +158,31 @@ def render_landing():
         submitted = st.form_submit_button("🔍 Search Events", use_container_width=True)
         
         if submitted and intent:
-            # Create search query
-            query = SearchQuery(
-                intent=intent,
-                persona=persona,
-                location=location if location else None,
-                date_from=datetime.combine(date_from, datetime.min.time()),
-                date_to=datetime.combine(date_to, datetime.max.time()),
-                industry=industry if industry else None,
-                max_price=max_price,
-                pitch_only=pitch_only,
-                online_only=online_only,
-                match_location_strictly=match_location_strictly if location else False,
-            )
-            
-            # Execute search
-            with st.spinner("🔎 Searching for events..."):
-                results = execute_search(query)
-                st.session_state.search_results = results
-            
-            st.success(f"Found {len(results)} matching events!")
-            st.rerun()
+            # Validate max_price is positive
+            if max_price < 0:
+                st.error("❌ Max ticket price cannot be negative. Please enter a non-negative value.")
+            else:
+                # Create search query
+                query = SearchQuery(
+                    intent=intent,
+                    persona=persona,
+                    location=location if location else None,
+                    date_from=datetime.combine(date_from, datetime.min.time()),
+                    date_to=datetime.combine(date_to, datetime.max.time()),
+                    industry=industry if industry else None,
+                    max_price=max_price,
+                    pitch_only=pitch_only,
+                    online_only=online_only,
+                    match_location_strictly=match_location_strictly if location else False,
+                )
+                
+                # Execute search
+                with st.spinner("🔎 Searching for events..."):
+                    results = execute_search(query)
+                    st.session_state.search_results = results
+                
+                st.success(f"Found {len(results)} matching events!")
+                st.rerun()
 
 
 def execute_search(query: SearchQuery) -> List[RankedEvent]:
@@ -252,6 +256,22 @@ def execute_search(query: SearchQuery) -> List[RankedEvent]:
     
     # Step 5: Rank results
     ranked = ranker_agent.rank(query, candidates)
+    
+    # Step 5.5: Apply strict date filtering
+    if query.date_from or query.date_to:
+        date_filtered = []
+        for ranked_event in ranked:
+            event = ranked_event.event
+            
+            # Check if event is within the date range
+            if query.date_from and event.start_utc < query.date_from:
+                continue  # Event starts before the from date
+            if query.date_to and event.start_utc > query.date_to:
+                continue  # Event starts after the to date
+            
+            date_filtered.append(ranked_event)
+        
+        ranked = date_filtered
     
     # Step 6: Apply strict location filter if requested
     if query.match_location_strictly and query.location:
