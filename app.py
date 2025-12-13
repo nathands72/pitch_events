@@ -149,6 +149,11 @@ def render_landing():
                 )
                 
                 online_only = st.checkbox("Online events only", value=False)
+                match_location_strictly = st.checkbox(
+                    "Match location strictly",
+                    value=False,
+                    help="Only show events in the specified location (or online events). Note: This option only applies when a location is specified."
+                )
         
         submitted = st.form_submit_button("🔍 Search Events", use_container_width=True)
         
@@ -164,6 +169,7 @@ def render_landing():
                 max_price=max_price,
                 pitch_only=pitch_only,
                 online_only=online_only,
+                match_location_strictly=match_location_strictly if location else False,
             )
             
             # Execute search
@@ -246,6 +252,26 @@ def execute_search(query: SearchQuery) -> List[RankedEvent]:
     
     # Step 5: Rank results
     ranked = ranker_agent.rank(query, candidates)
+    
+    # Step 6: Apply strict location filter if requested
+    if query.match_location_strictly and query.location:
+        from utils.location_matcher import matches_location
+        
+        filtered = []
+        
+        for ranked_event in ranked:
+            event = ranked_event.event
+            
+            # Always include online events
+            if event.venue.type == "online":
+                filtered.append(ranked_event)
+                continue
+            
+            # Check if location matches semantically
+            if matches_location(query.location, event.venue.city, event.venue.country):
+                filtered.append(ranked_event)
+        
+        return filtered[:10]  # Top 10
     
     return ranked[:10]  # Top 10
 

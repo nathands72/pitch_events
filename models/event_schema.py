@@ -162,6 +162,7 @@ class SearchQuery(BaseModel):
     max_price: Optional[float] = None
     pitch_only: bool = False  # Only events with pitch slots
     online_only: bool = False
+    match_location_strictly: bool = False  # Strictly filter by location if provided
     
     # Pagination
     max_results: int = 10

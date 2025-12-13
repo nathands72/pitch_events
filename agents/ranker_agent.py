@@ -111,20 +111,23 @@ class RankerAgent:
     
     def _score_logistics(self, query: SearchQuery, event: CanonicalEvent) -> float:
         """Score based on location match and accessibility."""
+        from utils.location_matcher import matches_location
+        
         score = 0.5  # Base score
         
         # Online events are always accessible
         if event.venue.type == "online":
             score = 1.0
         
-        # Location match
+        # Location match using semantic matching
         if query.location:
-            query_loc = query.location.lower()
-            
-            if event.venue.city and query_loc in event.venue.city.lower():
-                score = 1.0
-            elif event.venue.country and query_loc in event.venue.country.lower():
-                score = 0.7
+            # Check if location matches semantically
+            if matches_location(query.location, event.venue.city, event.venue.country):
+                # Give higher score for city-level match, lower for country-level
+                if event.venue.city:
+                    score = 1.0
+                else:
+                    score = 0.7
         
         # Price consideration
         if query.max_price is not None:
